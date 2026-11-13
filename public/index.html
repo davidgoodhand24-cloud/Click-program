@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Built by Dave PT</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script>
     tailwind.config = {
       theme: {
@@ -34,13 +33,11 @@
   <div id="app" class="min-h-screen"></div>
 
   <script type="module">
-    const SUPABASE_URL = 'https://ddnomuajxbgmvuwmemay.supabase.co';
-    const SUPABASE_KEY = 'sb_publishable_MmSSuPjuJDFomWV6K8pLKw_JSMkUd6t';
-    // Capture the URL hash before the Supabase client consumes it, so we can tell
-    // when the user has arrived from a password reset email.
-    const initialHashParams = new URLSearchParams(window.location.hash.slice(1));
-    let recoveryMode = initialHashParams.get('type') === 'recovery';
-    const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    import * as identity from 'https://esm.sh/@netlify/identity@2.0.1';
+    import { api, store } from './data.js';
+    let recoveryMode = false;
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+    let savingProgram = false;
 
     let currentUser = null;
     let currentProfile = null;
@@ -70,102 +67,49 @@
 
     async function init() {
       showLoading('Connecting...');
-      const { data: { session }, error } = await supabase.auth.getSession();
-      if (error) throw error;
-      const linkError = initialHashParams.get('error_description');
-      if (recoveryMode && session?.user) {
-        currentView = 'reset';
-        render();
-      } else if (session?.user) {
-        await loadProfile(session.user);
-      } else {
-        currentView = 'login';
-        render();
-        if (linkError) toast(linkError.replace(/\+/g, ' '), true);
-      }
-      supabase.auth.onAuthStateChange((event, session) => {
-        if (event === 'PASSWORD_RECOVERY') {
-          recoveryMode = true;
-          currentView = 'reset';
-          render();
-        } else if (event === 'SIGNED_IN' && session?.user && !recoveryMode) {
-          // Run database requests after the auth callback releases its session lock.
-          setTimeout(() => loadProfile(session.user).catch(showAuthError), 0);
-        } else if (event === 'SIGNED_OUT') {
-          recoveryMode = false;
-          currentUser = null;
-          currentProfile = null;
-          currentView = 'login';
-          render();
+      const callback = await identity.handleAuthCallback();
+      if (callback?.type === 'recovery') recoveryMode = true;
+      identity.onAuthChange((event, user) => {
+        if (event === 'recovery') { recoveryMode = true; currentView = 'reset'; render(); }
+        else if (event === 'logout') {
+          recoveryMode = false; currentUser = null; currentProfile = null;
+          clients = []; exercises = []; programs = []; editingProgram = null;
+          currentView = 'login'; render();
         }
       });
+      const user = await identity.getUser();
+      if (recoveryMode && user) { currentView = 'reset'; render(); }
+      else if (user) await loadProfile(user);
+      else { currentView = 'login'; render(); }
     }
 
     async function loadProfile(user) {
-      currentUser = user;
-      let { data: profile, error } = await supabase.from('profiles').select('*').eq('id', user.id).single();
-
-      if (error || !profile) {
-        const { count } = await supabase.from('profiles').select('*', { count: 'exact', head: true });
-        const role = (count === 0 || count === null) ? 'trainer' : 'client';
-        const { data: newProfile, error: insertErr } = await supabase.from('profiles').insert({
-          id: user.id,
-          email: user.email,
-          full_name: user.user_metadata?.full_name || user.email.split('@')[0],
-          role
-        }).select().single();
-        if (insertErr) {
-          toast('Could not create profile: ' + insertErr.message, true);
-          currentView = 'login';
-          render();
-          return;
-        }
-        currentProfile = newProfile;
-      } else {
-        currentProfile = profile;
-      }
-
-      if (currentProfile.role === 'trainer') {
-        currentView = 'dashboard';
-        await loadTrainerData();
-      } else {
-        currentView = 'client-home';
-        await loadClientData();
-      }
+      const { data: profile, error } = await api('/api/me');
+      if (error) throw new Error(error.message);
+      currentProfile = profile;
+      currentUser = { ...user, id: profile.id, email: profile.email };
+      if (profile.role === 'trainer') { currentView = 'dashboard'; await loadTrainerData(); }
+      else { currentView = 'client-home'; await loadClientData(); }
       render();
     }
 
     async function loadTrainerData() {
       const [cRes, eRes, pRes] = await Promise.all([
-        supabase.from('clients').select('*').eq('trainer_id', currentUser.id).order('created_at', { ascending: false }),
-        supabase.from('exercises').select('*').eq('trainer_id', currentUser.id).order('name'),
-        supabase.from('programs').select('*').eq('trainer_id', currentUser.id).order('created_at', { ascending: false })
+        store.from('clients').select('*').eq('trainer_id', currentUser.id).order('created_at', { ascending: false }),
+        store.from('exercises').select('*').eq('trainer_id', currentUser.id).order('name'),
+        store.from('programs').select('*').eq('trainer_id', currentUser.id).order('created_at', { ascending: false })
       ]);
+      const error = cRes.error || eRes.error || pRes.error;
+      if (error) throw new Error(error.message);
       clients = cRes.data || [];
       exercises = eRes.data || [];
       programs = pRes.data || [];
     }
 
     async function loadClientData() {
-      let { data: clientRec } = await supabase.from('clients').select('*, client_programs(program_id)').eq('user_id', currentUser.id).maybeSingle();
-      if (!clientRec && currentUser.email) {
-        // The trainer adds clients by email; link this login to that record the first time the client signs in.
-        const { data: byEmail } = await supabase.from('clients').select('*, client_programs(program_id)')
-          .eq('email', currentUser.email.toLowerCase()).is('user_id', null).limit(1).maybeSingle();
-        if (byEmail) {
-          const { error: linkErr } = await supabase.from('clients').update({ user_id: currentUser.id }).eq('id', byEmail.id);
-          if (linkErr) console.warn('Could not link client record:', linkErr.message);
-          clientRec = byEmail;
-        }
-      }
-      if (clientRec) {
-        selectedClientId = clientRec.id;
-        const programIds = (clientRec.client_programs || []).map(cp => cp.program_id);
-        if (programIds.length) {
-          const { data: progs } = await supabase.from('programs').select('*').in('id', programIds);
-          programs = progs || [];
-        } else programs = [];
-      } else programs = [];
+      const { data, error } = await store.from('programs').select('*');
+      if (error) throw new Error(error.message);
+      programs = data || [];
     }
 
     function render() {
@@ -240,7 +184,7 @@
                 ${isSignup ? `Already have an account? <button onclick="window.setAuthView('login')" class="text-brand-red hover:underline">Log in</button>` : `New here? <button onclick="window.setAuthView('signup')" class="text-brand-red hover:underline">Create account</button>`}
               </div>
             </div>
-            <p class="text-center text-xs text-gray-600 mt-6">First account created becomes the Trainer</p>
+            <p class="text-center text-xs text-gray-600 mt-6">Existing users: create a Netlify account with your existing email to connect your records. Trainer access carries over after email confirmation.</p>
           </div>
         </div>`;
     }
@@ -254,9 +198,8 @@
       const email = document.getElementById('auth-email').value.trim();
       if (!email) { toast('Email required', true); return; }
       showLoading('Sending reset link...');
-      const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: window.location.origin + window.location.pathname
-      });
+      let error;
+      try { await identity.requestPasswordRecovery(email); } catch (e) { error = e; }
       currentView = error ? 'forgot' : 'login';
       renderAuth();
       if (error) {
@@ -273,7 +216,8 @@
       if (!password || password.length < 6) { toast('Password must be at least 6 characters', true); return; }
       if (password !== confirm) { toast('Passwords do not match', true); return; }
       showLoading('Updating password...');
-      const { data, error } = await supabase.auth.updateUser({ password });
+      let user, error;
+      try { user = await identity.updateUser({ password }); } catch (e) { error = e; }
       if (error) {
         renderResetPassword();
         toast(error.message || 'Could not update password. Please try again.', true);
@@ -281,7 +225,7 @@
       }
       recoveryMode = false;
       toast('Password updated');
-      await loadProfile(data.user).catch(showAuthError);
+      await loadProfile(user).catch(showAuthError);
     };
 
     function showAuthError(error) {
@@ -300,16 +244,14 @@
       showLoading(mode === 'signup' ? 'Creating account...' : 'Logging in...');
       try {
         if (mode === 'signup') {
-          const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { full_name: fullName || email.split('@')[0] } } });
-          if (error) throw error;
-          if (!data.session) {
-            currentView = 'login';
-            renderAuth();
+          const user = await identity.signup(email, password, { full_name: fullName || email.split('@')[0] });
+          if (!user.emailVerified) {
+            currentView = 'login'; renderAuth();
             toast('Check your email and confirm your account before logging in.');
-          }
+          } else await loadProfile(user);
         } else {
-          const { error } = await supabase.auth.signInWithPassword({ email, password });
-          if (error) throw error;
+          const user = await identity.login(email, password);
+          await loadProfile(user);
         }
       } catch (error) {
         currentView = mode === 'signup' ? 'signup' : 'login';
@@ -319,7 +261,7 @@
       }
     };
 
-    window.handleLogout = async function() { await supabase.auth.signOut(); };
+    window.handleLogout = async function() { try { await identity.logout(); } catch (error) { toast(error.message, true); } };
 
     function renderTrainer() {
       const nav = `
@@ -363,9 +305,9 @@
     function renderDashboard() {
       const cards = clients.map(c => `
         <div onclick="window.setView('client-detail', '${c.id}')" class="bg-brand-dark border border-brand-gray rounded-xl p-5 cursor-pointer hover:border-brand-red transition-colors">
-          <div class="flex justify-between items-start"><h3 class="font-semibold text-lg">${c.full_name}</h3>
-          <span class="text-xs px-2 py-1 rounded-full ${c.status==='Active' ? 'bg-green-900/50 text-green-400' : 'bg-yellow-900/50 text-yellow-400'}">${c.status || 'Active'}</span></div>
-          <p class="text-gray-400 text-sm mt-2">${c.email || ''}</p>
+          <div class="flex justify-between items-start"><h3 class="font-semibold text-lg">${escapeHtml(c.full_name)}</h3>
+          <span class="text-xs px-2 py-1 rounded-full ${c.status==='Active' ? 'bg-green-900/50 text-green-400' : 'bg-yellow-900/50 text-yellow-400'}">${escapeHtml(c.status || 'Active')}</span></div>
+          <p class="text-gray-400 text-sm mt-2">${escapeHtml(c.email || '')}</p>
           <p class="text-gray-500 text-xs mt-1">Started ${c.start_date || ''}</p>
         </div>`).join('') || '<p class="text-gray-500 col-span-full">No clients yet. Add your first client.</p>';
       return `<div class="flex justify-between items-center mb-8"><h2 class="text-2xl font-bold">My Clients</h2>
@@ -378,7 +320,7 @@
       if (!full_name) return;
       const email = prompt('Client email (they will use this to log in later):');
       if (!email) return;
-      const { error } = await supabase.from('clients').insert({
+      const { error } = await store.from('clients').insert({
         trainer_id: currentUser.id, full_name, email: email.toLowerCase(), status: 'Active',
         start_date: new Date().toISOString().slice(0, 10)
       });
@@ -393,23 +335,23 @@
       return `
         <button onclick="window.setView('dashboard')" class="text-gray-400 hover:text-white text-sm mb-6">← Back to Clients</button>
         <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
-          <div><h2 class="text-2xl font-bold">${c.full_name}</h2><p class="text-gray-400 text-sm mt-1">${c.email || ''}</p></div>
-          <span class="text-xs px-3 py-1 rounded-full ${c.status==='Active' ? 'bg-green-900/50 text-green-400' : 'bg-yellow-900/50 text-yellow-400'} w-fit">${c.status || 'Active'}</span>
+          <div><h2 class="text-2xl font-bold">${escapeHtml(c.full_name)}</h2><p class="text-gray-400 text-sm mt-1">${escapeHtml(c.email || '')}</p></div>
+          <span class="text-xs px-3 py-1 rounded-full ${c.status==='Active' ? 'bg-green-900/50 text-green-400' : 'bg-yellow-900/50 text-yellow-400'} w-fit">${escapeHtml(c.status || 'Active')}</span>
         </div>
         <div class="grid lg:grid-cols-2 gap-8">
           <div class="bg-brand-dark border border-brand-gray rounded-xl p-6">
             <h3 class="font-semibold text-brand-red mb-4">Profile</h3>
             <div class="space-y-3 text-sm">
-              <div><span class="text-gray-400">Phone</span><input id="c-phone" value="${c.phone || ''}" class="mt-1 w-full px-3 py-2 rounded border text-sm" /></div>
+              <div><span class="text-gray-400">Phone</span><input id="c-phone" value="${escapeHtml(c.phone || '')}" class="mt-1 w-full px-3 py-2 rounded border text-sm" /></div>
               <div><span class="text-gray-400">Age</span><input id="c-age" type="number" value="${c.age || ''}" class="mt-1 w-full px-3 py-2 rounded border text-sm" /></div>
-              <div><span class="text-gray-400">Goals</span><textarea id="c-goals" class="mt-1 w-full px-3 py-2 rounded border text-sm" rows="2">${c.goals || ''}</textarea></div>
-              <div><span class="text-gray-400">Injuries</span><textarea id="c-injuries" class="mt-1 w-full px-3 py-2 rounded border text-sm" rows="2">${c.injuries || ''}</textarea></div>
+              <div><span class="text-gray-400">Goals</span><textarea id="c-goals" class="mt-1 w-full px-3 py-2 rounded border text-sm" rows="2">${escapeHtml(c.goals || '')}</textarea></div>
+              <div><span class="text-gray-400">Injuries</span><textarea id="c-injuries" class="mt-1 w-full px-3 py-2 rounded border text-sm" rows="2">${escapeHtml(c.injuries || '')}</textarea></div>
               <button onclick="window.saveClientProfile()" class="mt-2 bg-brand-red hover:bg-brand-red-dark px-4 py-2 rounded-lg text-sm font-medium">Save Profile</button>
             </div>
           </div>
           <div class="bg-brand-dark border border-brand-gray rounded-xl p-6">
             <h3 class="font-semibold text-brand-red mb-4">Private Trainer Notes</h3>
-            <textarea id="c-notes" class="w-full px-3 py-2 rounded border text-sm h-40" placeholder="Private notes only you can see...">${c.notes || ''}</textarea>
+            <textarea id="c-notes" class="w-full px-3 py-2 rounded border text-sm h-40" placeholder="Private notes only you can see...">${escapeHtml(c.notes || '')}</textarea>
             <button onclick="window.saveClientNotes()" class="mt-3 bg-brand-red hover:bg-brand-red-dark px-4 py-2 rounded-lg text-sm font-medium">Save Notes</button>
           </div>
         </div>
@@ -417,7 +359,7 @@
           <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
             <h3 class="font-semibold text-brand-red">Assigned Programs</h3>
             <div class="flex gap-2 items-center">
-              <select id="assign-program" class="px-3 py-2 rounded-lg border text-sm"><option value="">Select program...</option>${programs.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}</select>
+              <select id="assign-program" class="px-3 py-2 rounded-lg border text-sm"><option value="">Select program...</option>${programs.map(p => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('')}</select>
               <button onclick="window.assignProgram()" class="bg-brand-red hover:bg-brand-red-dark px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap">Assign</button>
             </div>
           </div>
@@ -426,13 +368,13 @@
     }
 
     async function loadAssignments(clientId) {
-      const { data } = await supabase.from('client_programs').select('id, program_id, programs(id, name, days_per_week)').eq('client_id', clientId);
+      const { data } = await store.from('client_programs').select('id, program_id, programs(id, name, days_per_week)').eq('client_id', clientId);
       const el = document.getElementById('assigned-list');
       if (!el) return;
       if (!data || !data.length) { el.innerHTML = '<p class="text-gray-500 text-sm">No programs assigned yet.</p>'; return; }
       el.innerHTML = data.map(row => `
         <div class="flex items-center justify-between bg-brand-gray rounded-lg px-4 py-3">
-          <div><div class="font-medium">${row.programs?.name || 'Program'}</div><div class="text-sm text-gray-400">${row.programs?.days_per_week || '?'} days/week</div></div>
+          <div><div class="font-medium">${escapeHtml(row.programs?.name || 'Program')}</div><div class="text-sm text-gray-400">${row.programs?.days_per_week || '?'} days/week</div></div>
           <div class="flex gap-3">
             <button onclick="window.setView('program-edit', '${row.program_id}')" class="text-sm text-brand-red hover:underline">View</button>
             <button onclick="window.unassignProgram('${row.id}')" class="text-sm text-gray-400 hover:text-red-400">Remove</button>
@@ -441,7 +383,7 @@
     }
 
     window.saveClientProfile = async function() {
-      const { error } = await supabase.from('clients').update({
+      const { error } = await store.from('clients').update({
         phone: document.getElementById('c-phone').value,
         age: parseInt(document.getElementById('c-age').value) || null,
         goals: document.getElementById('c-goals').value,
@@ -451,20 +393,20 @@
     };
 
     window.saveClientNotes = async function() {
-      const { error } = await supabase.from('clients').update({ notes: document.getElementById('c-notes').value }).eq('id', selectedClientId);
+      const { error } = await store.from('clients').update({ notes: document.getElementById('c-notes').value }).eq('id', selectedClientId);
       if (error) toast(error.message, true); else toast('Notes saved');
     };
 
     window.assignProgram = async function() {
       const pid = document.getElementById('assign-program').value;
       if (!pid) return;
-      const { error } = await supabase.from('client_programs').insert({ client_id: selectedClientId, program_id: pid });
+      const { error } = await store.from('client_programs').insert({ client_id: selectedClientId, program_id: pid });
       if (error) { if (error.code === '23505') toast('Already assigned', true); else toast(error.message, true); return; }
       toast('Program assigned'); loadAssignments(selectedClientId);
     };
 
     window.unassignProgram = async function(assignmentId) {
-      const { error } = await supabase.from('client_programs').delete().eq('id', assignmentId);
+      const { error } = await store.from('client_programs').delete().eq('id', assignmentId);
       if (error) toast(error.message, true); else { toast('Removed'); loadAssignments(selectedClientId); }
     };
 
@@ -477,8 +419,8 @@
       });
       const list = filtered.map(e => `
         <div class="bg-brand-gray rounded-lg px-4 py-3 flex justify-between items-start gap-4">
-          <div><div class="font-medium">${e.name}</div><div class="text-xs text-brand-red mt-0.5">${e.category || ''}</div>
-          <div class="text-sm text-gray-400 mt-1">${e.description || ''}</div></div>
+          <div><div class="font-medium">${escapeHtml(e.name)}</div><div class="text-xs text-brand-red mt-0.5">${escapeHtml(e.category || '')}</div>
+          <div class="text-sm text-gray-400 mt-1">${escapeHtml(e.description || '')}</div></div>
           <button onclick="window.editExercise('${e.id}')" class="text-sm text-gray-400 hover:text-white shrink-0">Edit</button>
         </div>`).join('') || '<p class="text-gray-500">No exercises yet. Add some!</p>';
       return `
@@ -487,7 +429,7 @@
           <button onclick="window.addExercise()" class="bg-brand-red hover:bg-brand-red-dark px-4 py-2 rounded-lg font-medium text-sm">+ Add Exercise</button>
         </div>
         <div class="flex flex-col sm:flex-row gap-3 mb-6">
-          <input type="text" placeholder="Search exercises..." value="${librarySearch}" class="flex-1 px-4 py-2.5 rounded-lg border text-sm" oninput="librarySearch=this.value; render()" />
+          <input type="text" placeholder="Search exercises..." value="${escapeHtml(librarySearch)}" class="flex-1 px-4 py-2.5 rounded-lg border text-sm" oninput="librarySearch=this.value; render()" />
           <div class="flex flex-wrap gap-2">${categories.map(cat => `<button onclick="libraryFilter='${cat}'; render()" class="px-3 py-1.5 rounded-full text-sm ${libraryFilter===cat ? 'bg-brand-red text-white' : 'bg-brand-gray text-gray-300 hover:text-white'}">${cat}</button>`).join('')}</div>
         </div>
         <div class="space-y-2">${list}</div>`;
@@ -498,7 +440,7 @@
       if (!name) return;
       const category = prompt('Category (Legs / Push / Pull / Core / Cardio):', 'Legs') || 'Legs';
       const description = prompt('Short description (optional):') || '';
-      const { error } = await supabase.from('exercises').insert({ trainer_id: currentUser.id, name, category, description });
+      const { error } = await store.from('exercises').insert({ trainer_id: currentUser.id, name, category, description });
       if (error) toast(error.message, true); else { toast('Exercise added'); await loadTrainerData(); render(); }
     };
 
@@ -510,16 +452,16 @@
       const category = prompt('Category:', e.category || 'Legs');
       if (category === null) return;
       const description = prompt('Description:', e.description || '');
-      const { error } = await supabase.from('exercises').update({ name, category, description }).eq('id', id);
+      const { error } = await store.from('exercises').update({ name, category, description }).eq('id', id);
       if (error) toast(error.message, true); else { toast('Updated'); await loadTrainerData(); render(); }
     };
 
     function renderProgramsList() {
       const cards = programs.map(p => `
         <div class="bg-brand-dark border border-brand-gray rounded-xl p-5 hover:border-brand-red transition-colors">
-          <h3 class="font-semibold text-lg">${p.name}</h3>
+          <h3 class="font-semibold text-lg">${escapeHtml(p.name)}</h3>
           <p class="text-gray-400 text-sm mt-1">${p.days_per_week || 3} days/week · ${(p.days || []).length} days built</p>
-          <p class="text-gray-500 text-sm mt-2 line-clamp-2">${p.description || ''}</p>
+          <p class="text-gray-500 text-sm mt-2 line-clamp-2">${escapeHtml(p.description || '')}</p>
           <div class="mt-4 flex gap-2">
             <button onclick="window.setView('program-edit', '${p.id}')" class="text-sm bg-brand-gray hover:bg-brand-red px-3 py-1.5 rounded-lg">Edit</button>
             <button onclick="window.deleteProgram('${p.id}')" class="text-sm text-gray-400 hover:text-red-400 px-3 py-1.5">Delete</button>
@@ -532,7 +474,7 @@
 
     window.deleteProgram = async function(id) {
       if (!confirm('Delete this program?')) return;
-      const { error } = await supabase.from('programs').delete().eq('id', id);
+      const { error } = await store.from('programs').delete().eq('id', id);
       if (error) toast(error.message, true); else { toast('Deleted'); await loadTrainerData(); render(); }
     };
 
@@ -542,17 +484,19 @@
         const exercisesHtml = (day.exercises || []).map((ex, exIdx) => {
           const e = exercises.find(x => x.id === ex.exercise_id) || { name: ex.name || 'Exercise' };
           return `<div class="flex flex-wrap items-center gap-2 bg-brand-gray rounded-lg px-3 py-2 text-sm">
-            <span class="font-medium flex-1 min-w-[140px]">${e.name}</span>
-            <input value="${ex.sets || '3'}" onchange="editingProgram.days[${dayIdx}].exercises[${exIdx}].sets=this.value" class="w-14 px-2 py-1 rounded border text-center" placeholder="Sets" />
-            <span class="text-gray-500">×</span>
-            <input value="${ex.reps || '8-10'}" onchange="editingProgram.days[${dayIdx}].exercises[${exIdx}].reps=this.value" class="w-20 px-2 py-1 rounded border text-center" placeholder="Reps" />
-            <input value="${ex.rest || '90s'}" onchange="editingProgram.days[${dayIdx}].exercises[${exIdx}].rest=this.value" class="w-16 px-2 py-1 rounded border text-center" placeholder="Rest" />
+            <span class="font-medium flex-1 min-w-[140px]">${escapeHtml(e.name)}</span>
+            ${[
+              ['sets', 'Sets', 'number', '1', '1', ex.sets ?? 3],
+              ['reps', 'Reps', 'text', '', '', ex.reps ?? '8-10'],
+              ['weight', 'Weight (kg)', 'number', '0', '0.01', ex.weight ?? ''],
+              ['rest_time', 'Rest (seconds)', 'number', '0', '1', ex.rest_time ?? 90]
+            ].map(([key,label,type,min,step,value]) => `<label class="text-xs text-gray-400 flex flex-col gap-1">${label}<input aria-label="${label} for ${escapeHtml(e.name)}" type="${type}" ${min ? `min="${min}"` : ''} ${step ? `step="${step}"` : ''} value="${escapeHtml(value)}" oninput="editingProgram.days[${dayIdx}].exercises[${exIdx}].${key}=this.value" class="w-24 px-2 py-1 rounded border text-center text-sm" ${key !== 'weight' ? 'required' : ''} /></label>`).join('')}
             <button onclick="editingProgram.days[${dayIdx}].exercises.splice(${exIdx},1); render()" class="text-gray-400 hover:text-red-400 ml-1">✕</button>
           </div>`;
         }).join('') || '<p class="text-gray-500 text-sm py-2">No exercises yet.</p>';
         return `<div class="bg-brand-dark border border-brand-gray rounded-xl p-5 mb-4">
           <div class="flex items-center justify-between mb-3">
-            <input value="${day.name || 'Day'}" onchange="editingProgram.days[${dayIdx}].name=this.value" class="font-semibold bg-transparent border-b border-transparent hover:border-brand-gray focus:border-brand-red px-1 py-0.5 text-lg w-full max-w-xs" />
+            <input value="${escapeHtml(day.name || 'Day')}" oninput="editingProgram.days[${dayIdx}].name=this.value" class="font-semibold bg-transparent border-b border-transparent hover:border-brand-gray focus:border-brand-red px-1 py-0.5 text-lg w-full max-w-xs" />
             <button onclick="if(editingProgram.days.length>1){editingProgram.days.splice(${dayIdx},1);render()}" class="text-sm text-gray-400 hover:text-red-400 shrink-0">Remove Day</button>
           </div>
           <div class="space-y-2 mb-3">${exercisesHtml}</div>
@@ -563,39 +507,52 @@
         <button onclick="window.setView('programs')" class="text-gray-400 hover:text-white text-sm mb-6">← Back to Programs</button>
         <div class="bg-brand-dark border border-brand-gray rounded-xl p-6 mb-6">
           <div class="grid sm:grid-cols-2 gap-4 mb-4">
-            <div><label class="block text-sm text-gray-400 mb-1">Program Name</label><input id="prog-name" value="${editingProgram.name || ''}" class="w-full px-3 py-2 rounded-lg border" /></div>
-            <div><label class="block text-sm text-gray-400 mb-1">Days per week</label><input id="prog-dpw" type="number" min="1" max="7" value="${editingProgram.days_per_week || 3}" class="w-full px-3 py-2 rounded-lg border" /></div>
+            <div><label class="block text-sm text-gray-400 mb-1">Program Name</label><input id="prog-name" oninput="editingProgram.name=this.value" value="${escapeHtml(editingProgram.name)}" class="w-full px-3 py-2 rounded-lg border" /></div>
+            <div><label class="block text-sm text-gray-400 mb-1">Days per week</label><input id="prog-dpw" oninput="editingProgram.days_per_week=this.value" type="number" min="1" max="7" value="${escapeHtml(editingProgram.days_per_week ?? 3)}" class="w-full px-3 py-2 rounded-lg border" /></div>
           </div>
-          <div><label class="block text-sm text-gray-400 mb-1">Description</label><textarea id="prog-desc" class="w-full px-3 py-2 rounded-lg border" rows="2">${editingProgram.description || ''}</textarea></div>
+          <div><label class="block text-sm text-gray-400 mb-1">Description</label><textarea id="prog-desc" oninput="editingProgram.description=this.value" class="w-full px-3 py-2 rounded-lg border" rows="2">${escapeHtml(editingProgram.description)}</textarea></div>
         </div>
         <h3 class="font-semibold text-lg mb-4">Training Days</h3>${daysHtml}
         <div class="flex flex-wrap gap-3 mt-4">
           <button onclick="editingProgram.days.push({name:'Day '+(editingProgram.days.length+1), exercises:[]}); render()" class="bg-brand-gray hover:bg-brand-red px-4 py-2 rounded-lg text-sm font-medium">+ Add Day</button>
-          <button onclick="window.saveProgram()" class="bg-brand-red hover:bg-brand-red-dark px-6 py-2 rounded-lg text-sm font-medium">Save Program</button>
+          <button id="save-program" ${savingProgram ? 'disabled' : ''} onclick="window.saveProgram()" class="bg-brand-red hover:bg-brand-red-dark px-6 py-2 rounded-lg text-sm font-medium">${savingProgram ? 'Saving...' : 'Save Program'}</button>
         </div>`;
     }
 
     window.addExerciseToDay = function(dayIdx) {
       if (!exercises.length) { toast('Add some exercises to the library first', true); return; }
-      const names = exercises.map(e => e.name).join('\\n');
-      const choice = prompt('Type part of the exercise name:\\n\\n' + names);
+      const names = exercises.map(e => e.name).join('\n');
+      const choice = prompt('Type part of the exercise name:\n\n' + names);
       if (!choice) return;
       const found = exercises.find(e => e.name.toLowerCase().includes(choice.toLowerCase()));
       if (!found) { toast('Exercise not found', true); return; }
-      editingProgram.days[dayIdx].exercises.push({ exercise_id: found.id, name: found.name, sets: '3', reps: '8-10', rest: '90s' });
+      editingProgram.days[dayIdx].exercises.push({ exercise_id: found.id, name: found.name, sets: 3, reps: '8-10', weight: '', rest_time: 90 });
       render();
     };
 
     window.saveProgram = async function() {
-      const name = document.getElementById('prog-name').value.trim() || 'Untitled Program';
-      const description = document.getElementById('prog-desc').value;
-      const days_per_week = parseInt(document.getElementById('prog-dpw').value) || 3;
-      const payload = { name, description, days_per_week, days: editingProgram.days, trainer_id: currentUser.id };
-      let error;
-      if (editingProgram.id) ({ error } = await supabase.from('programs').update(payload).eq('id', editingProgram.id));
-      else ({ error } = await supabase.from('programs').insert(payload));
-      if (error) toast(error.message, true);
-      else { toast('Program saved!'); await loadTrainerData(); window.setView('programs'); }
+      if (savingProgram) return;
+      const invalid = document.querySelector('#prog-dpw:invalid, input[required]:invalid, input[type="number"]:invalid');
+      if (invalid) { invalid.reportValidity(); return; }
+      savingProgram = true;
+      const button = document.getElementById('save-program');
+      if (button) { button.disabled = true; button.textContent = 'Saving...'; }
+      try {
+        const { data, error } = await api('/api/programs', { ...editingProgram,
+          name: document.getElementById('prog-name').value.trim(),
+          description: document.getElementById('prog-desc').value,
+          days_per_week: Number(document.getElementById('prog-dpw').value)
+        });
+        if (error) throw new Error(error.message);
+        editingProgram.id = data.id;
+        await loadTrainerData();
+        toast('Program saved!');
+        await window.setView('programs');
+      } catch (error) { toast(error.message, true); }
+      finally {
+        savingProgram = false;
+        if (button?.isConnected) { button.disabled = false; button.textContent = 'Save Program'; }
+      }
     };
 
     function renderClient() {
@@ -603,7 +560,7 @@
         <header class="bg-brand-dark border-b border-brand-gray sticky top-0 z-50">
           <div class="max-w-3xl mx-auto px-4 py-3 flex items-center justify-between">
             <div class="flex items-center gap-2"><span class="text-xl">🦍</span><span class="font-bold"><span class="text-white">Built by</span> <span class="text-brand-red">Dave PT</span></span></div>
-            <div class="flex items-center gap-4 text-sm"><span class="text-gray-400">Hi, ${currentProfile.full_name || 'Athlete'}</span>
+            <div class="flex items-center gap-4 text-sm"><span class="text-gray-400">Hi, ${escapeHtml(currentProfile.full_name || 'Athlete')}</span>
             <button onclick="window.handleLogout()" class="text-gray-400 hover:text-white">Logout</button></div>
           </div>
         </header>`;
@@ -628,9 +585,9 @@
       const cards = programs.map(p => `
         <div class="bg-brand-dark border border-brand-gray rounded-xl p-5 hover:border-brand-red transition-colors cursor-pointer"
           onclick="window.openClientProgram('${p.id}')">
-          <h3 class="font-semibold text-lg">${p.name}</h3>
+          <h3 class="font-semibold text-lg">${escapeHtml(p.name)}</h3>
           <p class="text-gray-400 text-sm mt-1">${p.days_per_week || 3} days per week · ${(p.days || []).length} training days</p>
-          <p class="text-gray-500 text-sm mt-2">${p.description || ''}</p>
+          <p class="text-gray-500 text-sm mt-2">${escapeHtml(p.description || '')}</p>
           <div class="mt-4 text-brand-red text-sm font-medium">View Program →</div>
         </div>`).join('') || `<div class="bg-brand-dark border border-brand-gray rounded-xl p-8 text-center text-gray-400">No programs assigned yet.<br>Your trainer will add some soon.</div>`;
       return `<h2 class="text-2xl font-bold mb-6">Your Programs</h2><div class="space-y-4">${cards}</div>`;
@@ -642,19 +599,23 @@
       const daysHtml = (p.days || []).map(day => {
         const exList = (day.exercises || []).map(ex => `
           <div class="flex justify-between items-center py-2 border-b border-brand-gray last:border-0">
-            <span>${ex.name || 'Exercise'}</span>
-            <span class="text-gray-400 text-sm">${ex.sets || ''} × ${ex.reps || ''}${ex.rest ? ' · ' + ex.rest : ''}</span>
+            <span>${escapeHtml(ex.name || 'Exercise')}</span>
+            <span class="text-gray-400 text-sm">${escapeHtml(ex.sets)} × ${escapeHtml(ex.reps)}${ex.weight != null && ex.weight !== '' ? ' · ' + escapeHtml(ex.weight) + ' kg' : ''}${ex.rest_time != null ? ' · ' + escapeHtml(ex.rest_time) + 's rest' : ''}</span>
           </div>`).join('') || '<p class="text-gray-500 text-sm">No exercises</p>';
-        return `<div class="bg-brand-dark border border-brand-gray rounded-xl p-5 mb-4"><h3 class="font-semibold text-brand-red mb-3">${day.name || 'Day'}</h3>${exList}</div>`;
+        return `<div class="bg-brand-dark border border-brand-gray rounded-xl p-5 mb-4"><h3 class="font-semibold text-brand-red mb-3">${escapeHtml(day.name || 'Day')}</h3>${exList}</div>`;
       }).join('');
       return `
         <button onclick="window.backToClientHome()" class="text-gray-400 hover:text-white text-sm mb-6">← Back to Programs</button>
-        <h2 class="text-2xl font-bold">${p.name}</h2>
+        <h2 class="text-2xl font-bold">${escapeHtml(p.name)}</h2>
         <p class="text-gray-400 mt-1 mb-6">${p.days_per_week || 3} days per week</p>
-        ${p.description ? `<p class="text-gray-300 mb-6">${p.description}</p>` : ''}
+        ${p.description ? `<p class="text-gray-300 mb-6">${escapeHtml(p.description)}</p>` : ''}
         ${daysHtml}`;
     }
 
+    Object.defineProperty(window, 'editingProgram', { get: () => editingProgram, set: value => { editingProgram = value; } });
+    window.render = render;
+    Object.defineProperty(window, 'libraryFilter', { get: () => libraryFilter, set: value => { libraryFilter = value; } });
+    Object.defineProperty(window, 'librarySearch', { get: () => librarySearch, set: value => { librarySearch = value; } });
     init().catch(showAuthError);
   </script>
 </body>
